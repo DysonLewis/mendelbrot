@@ -4,22 +4,13 @@ A high-performance, memory-efficient Mandelbrot set generator with multiple outp
 
 ## Files
 
-- **`hw8_fits.py`** - Generates FITS file and PNG output. Satisfies the homework guideline
-- **`hw8_deepzoom.py`** - Can generate much higher resolution images, at the cost of storage and time
+- **`mendelbrot.py`** - Can generate much higher resolution images, at the cost of storage and time
 - **`mandelbrot.cpp`** - C++ extension for fast Mandelbrot computation
 - **`Makefile`** - Builds the C++ extension module
 
 ## Approximate Image File Sizes
 
-Scaled on base resolution of 7680 x 10240 (78.6 megapixels):
-
-### FITS Pipeline (`hw8_fits.py`)
-| Multiplier | Resolution | FITS Output | PNG Output |
-|------------|------------|-------------|------------|
-| 1x | 7,680 × 10,240 | ~700 MB | ~50-100 MB |
-| 10x | 76,800 × 102,400 | ~70 GB | ~5-10 GB | (This will not run)
-
-### DeepZoom Pipeline (`hw8_deepzoom.py`)
+### DeepZoom Pipeline (`mandelbrot.py`)
 
 This was the only way I could get greater than around 5x resolution to work. Directly converting the FITS -> .png needed to load the entire file (even if it's processed in chunks)
 This quickly eats up memory, also very difficult to open the .png file. It seemed to crash around 50% I tried to open it in an image viewing program.
@@ -42,42 +33,6 @@ This quickly eats up memory, also very difficult to open the .png file. It seeme
 - DeepZoom pyramid: ~25% of raw size (final output, permanent)
 
 The max resolution I was able to test was 17x base, I would have gone higher but did not have the diskspace available (I need to clean my HST data lol), I think it took like 25 minutes to run on my machine.
-## Evolution of the Implementation
-
-### Stage 1: Original Assignment (`hw8_template.py`)
-- Basic Python implementation using NumPy's vectorized operations
-- Multiprocessing for parallel computation
-- Direct FITS file output using memory-mapped arrays
-- Limited resolution due to Python computation overhead
-
-### Stage 2: RGB Chunked Processing (`hw8_fits.py`)
-- Converted FITS data to RGB in chunks during write
-- Allowed slightly higher resolutions by processing data incrementally
-- Added PNG output with pyvips for memory-efficient conversion
-- **Bottleneck**: Python-based Mandelbrot computation was still too slow for very high resolutions
-
-### Stage 3: C++ Acceleration (`mandelbrot.cpp`)
-- Implemented core Mandelbrot calculation in C++
-- Following the pattern from hw1 (which used a C wrapper for computations)
-- Used C++ because I'm slightly more comfortable with it
-- Processes meshgrid arrays in batches for cache locality
-- Still generates FITS file, then converts to PNG
-
-### Stage 4: DeepZoom Optimization (`hw8_deepzoom.py`)
-- Initially tried loading entire RGB raw file into memory - failed at high resolutions
-- Switched to streaming architecture:
-  1. Compute Mandelbrot -> Write RGB chunks to raw file (memory-mapped)
-  2. Stream raw file -> TIFF with pyramid structure (tiled, compressed)
-  3. Stream TIFF -> DeepZoom pyramid (individual tile files)
-- **Bottleneck**: Each intermediate file took significant disk space and processing time
-
-### Stage 5: Direct RGB Pipeline (`hw8_deepzoom.py` - Final)
-- Eliminated FITS generation entirely
-- Direct pipeline: Mandelbrot computation -> RGB conversion -> Memory-mapped raw file -> DeepZoom
-- Removed unnecessary intermediate TIFF conversion
-- Maximum memory efficiency(I think?): processes everything in small chunks
-- This was about as good as I can optimize for memory, most of it was spent searching on how to un-cook my ram usage, then how to use the libraries, and then waiting for it to run.
-
 
 ## Requirements
 
