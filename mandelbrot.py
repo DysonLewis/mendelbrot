@@ -13,6 +13,7 @@ import shutil
 import gc
 import math
 from PIL import Image
+from tqdm import tqdm
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, script_dir)
@@ -22,7 +23,7 @@ try:
     import image_processor
 except ImportError:
     print("Error: mandelbrot or image_processor module not found")
-    print("Please run 'make' to compile the C++ extensions")
+    print("Please run 'python setup.py build_ext --inplace' to compile the C++ extensions")
     sys.exit(1)
 
 _log = logging.getLogger('mandelbrot')
@@ -36,8 +37,20 @@ r2_max = 1 << 16
 # This only changes the color, tbh I just liked how it looks at 100
 color_reference = 100
 
-# Image scale factor
-im_scale = 1
+# Get image scale factor from user
+while True:
+    try:
+        im_scale_input = input("Enter image scale factor (default 4): ").strip()
+        if im_scale_input == "":
+            im_scale = 4
+        else:
+            im_scale = int(im_scale_input)
+            if im_scale <= 0:
+                print("Scale factor must be positive")
+                continue
+        break
+    except ValueError:
+        print("Please enter a valid integer")
 
 # Define calculation domain and resolution
 xmin, xmax = -2.5, 1.
@@ -47,7 +60,7 @@ x = np.linspace(xmin, xmax, nx, endpoint=True)
 y = np.linspace(ymin, ymax, ny, endpoint=True)
 
 # DeepZoom tile size
-TILE_SIZE = 256
+TILE_SIZE = 512
 TILE_OVERLAP = 0
 
 # Setup for chunking the x-axis into columns
@@ -190,6 +203,7 @@ if __name__ == '__main__':
                         )
     
     logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
+    logging.getLogger('PIL').setLevel(logging.WARNING)
 
     _log.info(f'Generating Mandelbrot set at {ny} x {nx} resolution')
     
@@ -244,20 +258,22 @@ if __name__ == '__main__':
     current_strip_idx = 0
     
     # Process chunks and accumulate into strips
-    for j in range(nc):
-        i, rgb_chunk = outqueue.get()
-        _log.debug("received chunk %d/%d" % (i, nc))
-        
-        # Store chunk in the appropriate position
-        # For now, save chunks to temp files since they come out of order
-        chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
-        np.save(chunk_file, rgb_chunk)
-        
-        del rgb_chunk
-        
-        if (j + 1) % 50 == 0:
-            _log.debug(f"Progress: {j+1}/{nc} chunks computed")
-            gc.collect()
+    chunk_files = {}
+    with tqdm(total=nc, desc="Computing chunks", unit="chunk") as pbar:
+        for j in range(nc):
+            i, rgb_chunk = outqueue.get()
+            
+            # Store chunk in the appropriate position
+            # For now, save chunks to temp files since they come out of order
+            chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
+            np.save(chunk_file, rgb_chunk)
+            chunk_files[i] = chunk_file
+            
+            del rgb_chunk
+            pbar.update(1)
+            
+            if (j + 1) % 10 == 0:
+                gc.collect()
     
     # Clean up worker processes
     _log.debug('received all chunks; killing workers')
@@ -284,14 +300,14 @@ if __name__ == '__main__':
             nx, bx, ex, nc, tiles_dir, max_level, strips_per_height
         ))
     
-    # Process strips in parallel with limited workers to control memory
-    max_strip_workers = min(4, mp.cpu_count())
+    # Process strips in parallel
+    max_strip_workers = mp.cpu_count()
     _log.info(f'Processing {strips_per_height} strips with {max_strip_workers} workers')
     
     with mp.Pool(max_strip_workers) as pool:
-        for i, result in enumerate(pool.imap(process_strip_worker, strips_to_process)):
-            if (i + 1) % 10 == 0:
-                _log.debug(f"Processed strip {i + 1}/{strips_per_height}")
+        with tqdm(total=strips_per_height, desc="Processing strips", unit="strip") as pbar:
+            for result in pool.imap(process_strip_worker, strips_to_process):
+                pbar.update(1)
         pool.close()
         pool.join()
     
@@ -329,9 +345,9 @@ if __name__ == '__main__':
         max_tile_workers = mp.cpu_count() * 2
         
         with mp.Pool(max_tile_workers) as pool:
-            for i, result in enumerate(pool.imap_unordered(downsample_tile_worker, tiles_to_process)):
-                if (i + 1) % 200 == 0:
-                    _log.debug(f"Level {level}: processed {i + 1}/{len(tiles_to_process)} tiles")
+            with tqdm(total=len(tiles_to_process), desc=f"Level {level}", unit="tile") as pbar:
+                for result in pool.imap_unordered(downsample_tile_worker, tiles_to_process):
+                    pbar.update(1)
             pool.close()
             pool.join()
     
