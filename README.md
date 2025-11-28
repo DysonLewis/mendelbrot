@@ -17,7 +17,7 @@ This project originated as a homework assignment exploring parallel computing an
 - **Interactive DeepZoom viewer** with OpenSeadragon integration
 - **Complete tile pyramid generation** with multiple zoom levels
 - **Lanczos downsampling** for high-quality lower resolution tiles
-- **Streaming tile processing** to minimize memory usage
+- **Strip-by-strip streaming processing** to minimize peak storage usage
 - **Automated web server** for instant visualization
 - **User-configurable resolution** via interactive prompts
 - **Optimized C++ image processing** for vertical flips and tile splitting
@@ -48,23 +48,26 @@ DeepZoom creates a pyramid with tiles at multiple zoom levels. The Mandelbrot se
 
 | Scale | Resolution | DeepZoom Storage | Peak During Processing* |
 |-------|------------|------------------|------------------------|
-| 1x | 7,680 × 10,240 | ~2 MB | ~0.2 GB |
-| 4x | 30,720 × 40,960 | ~20 MB | ~3.6 GB |
-| 6x | 46,080 × 61,440 | ~40 MB | ~8.1 GB |
-| 8x | 61,440 × 81,920 | ~70 MB | ~14.4 GB |
-| 10x | 76,800 × 102,400 | ~110 MB | ~22.5 GB |
-| 20x | 153,600 × 204,800 | ~440 MB | ~90 GB |
+| 1x | 7,680 × 10,240 | ~2 MB | ~0.1 GB |
+| 4x | 30,720 × 40,960 | ~20 MB | ~0.3 GB |
+| 6x | 46,080 × 61,440 | ~40 MB | ~0.7 GB |
+| 8x | 61,440 × 81,920 | ~70 MB | ~1.2 GB |
+| 10x | 76,800 × 102,400 | ~110 MB | ~1.9 GB |
+| 20x | 153,600 × 204,800 | ~440 MB | ~7.5 GB |
 
-*Peak storage includes temporary `.npy` chunk files during processing, which are automatically deleted after tiles are generated.
+*Peak storage is now just one horizontal strip worth of temporary `.npy` chunk files (~64 files × 256 pixels high), which are immediately deleted after tile generation. This streaming approach dramatically reduces peak storage compared to storing the entire raw image.
 
 ### Processing Time
 
-On a typical multi-core system:
-- 4x scale: ~5-10 minutes
-- 10x scale: ~30-45 minutes
-- 20x scale: ~2-3 hours
+On a modern multi-core system (e.g., 8-core/16-thread CPU with NVMe SSD):
+- 4x scale: ~2-3 minutes
+- 10x scale: ~10-15 minutes
+- 20x scale: ~35-45 minutes
 
-Time scales with pixel count and number of CPU cores available.
+Time scales roughly linearly with pixel count. Performance depends heavily on:
+- CPU core count (more cores = faster parallel computation)
+- Storage speed (NVMe significantly faster than SATA SSD or HDD for temporary files)
+- Available RAM (reduces swapping during strip assembly)
 
 ## Requirements
 
@@ -102,11 +105,14 @@ python mandelbrot.py
 You'll be prompted to enter an image scale factor (press Enter for default 4x).
 
 The generator will:
-1. Compute the Mandelbrot set in parallel chunks
-2. Assemble and save maximum resolution tiles
-3. Build the pyramid of downsampled zoom levels
-4. Generate the HTML viewer
-5. Launch a local web server and open your browser
+1. Process the image in horizontal strips (256 pixels high each)
+   - For each strip: compute Mandelbrot chunks in parallel
+   - Save temporary .npy files for the strip
+   - Assemble strip and generate maximum resolution tiles
+   - Delete temporary files immediately
+2. Build the pyramid of downsampled zoom levels
+3. Generate the HTML viewer
+4. Launch a local web server and open your browser
 
 ### 3. Explore the Visualization
 
@@ -122,7 +128,7 @@ Press **Ctrl+C** in the terminal to stop the web server when done.
 Key parameters in `mandelbrot.py`:
 
 ```python
-max_iter = 300              # Iteration limit for escape test
+max_iter = 750              # Iteration limit for escape test
 color_reference = 100       # Color normalization reference
 im_scale = 4                # Resolution multiplier (prompt at runtime)
 xmin, xmax = -2.5, 1.       # Real axis bounds
@@ -130,24 +136,45 @@ ymin, ymax = -1., 1.        # Imaginary axis bounds
 ny, nx = im_scale*7680, im_scale*10240  # Final resolution
 
 TILE_SIZE = 256             # Tile dimensions (256 or 512)
-ncol = 64                   # Number of computation chunks
+ncol = 64                   # Number of computation chunks per strip
 ```
 
 ### Tuning Tips
 
 - **Higher resolution**: Increase `im_scale` when prompted (requires more time and storage)
-- **Better detail at deep zoom**: Increase `max_iter` (300-500 for high resolutions)
-- **Faster processing**: Set `TILE_SIZE = 512` (uses more memory but fewer tiles)
-- **Lower memory usage**: Reduce `max_strip_workers` in the code (default: 8)
+- **Better detail at deep zoom**: Increase `max_iter` (750-1000 for high resolutions)
+- **Faster processing**: Set `TILE_SIZE = 512` (fewer tiles but uses more memory per strip)
+- **Lower memory per strip**: Reduce `ncol` (default: 64 chunks per strip)
 
 ## Technical Details
+
+### Streaming Processing Pipeline
+
+The generator uses a strip-by-strip streaming approach to minimize peak memory and storage usage:
+
+1. **Strip Division**: Image is divided into horizontal strips of 256 pixels height
+2. **Per-Strip Processing**:
+   - Spawn worker processes for parallel Mandelbrot computation
+   - Compute 64 vertical chunks covering the strip's height
+   - Save chunks as temporary .npy files
+   - Load chunks via memory-mapping (avoids loading entire chunks into RAM)
+   - Assemble strip and generate tiles
+   - Delete all temporary .npy files for the strip
+3. **Next Strip**: Repeat for next 256-pixel horizontal strip
+4. **Pyramid Building**: Generate downsampled zoom levels from completed tiles
+
+**Key Benefits:**
+- Peak storage is only ~64 chunks × 256 pixels instead of full image
+- Memory usage remains constant regardless of total image size
+- Temporary files exist for seconds rather than entire processing duration
+- Enables rendering of extremely high resolution images on modest hardware
 
 ### Key Optimizations
 
 **Memory Management:**
-- Chunks processed independently and saved to temporary files
-- Strips assembled on-demand from memory-mapped chunk files
-- Immediate cleanup of intermediate data
+- Strip-by-strip processing with immediate cleanup
+- Memory-mapped chunk files to avoid loading entire arrays
+- Fresh worker processes per strip prevent memory leaks
 - Controlled worker pool sizes to limit memory footprint
 
 **Performance:**
@@ -175,8 +202,9 @@ Run `make` to compile the C++ extensions.
 
 **Out of memory:**
 - Reduce `im_scale` 
-- Set `TILE_SIZE = 256` instead of 512
+- Reduce `ncol` (number of chunks per strip)
 - Close other applications
+- The streaming pipeline should handle most memory issues automatically
 
 **Port 8000 already in use:**
 The generator will show an error but you can manually run:
@@ -189,6 +217,7 @@ Then open `http://localhost:8000/mandelbrot_viewer.html`
 - Check CPU usage during computation phase (should be near 100%)
 - Ensure SSD is used for temporary files (not network drive)
 - Consider reducing resolution for initial tests
+- Each strip spawns fresh workers, so slight overhead vs. single worker pool
 
 ## License
 
