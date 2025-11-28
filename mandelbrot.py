@@ -37,7 +37,47 @@ r2_max = 1 << 18
 # This only changes the color, tbh I just liked how it looks at 100
 color_reference = 100
 
-# Get image scale factor from user
+# Get image scale factor from user with time estimate
+def estimate_time(scale):
+    '''
+    Estimate processing time based on empirical formula: t = 12.977 × x^1.804
+    Function fit based on my machine timing running at 750 iterations 
+    '''
+    time_seconds = 12.977 * (scale ** 1.804)
+    time_minutes = time_seconds / 60
+    
+    if time_minutes < 1:
+        return f"{time_seconds:.0f} seconds"
+    elif time_minutes < 60:
+        return f"{time_minutes:.1f} minutes"
+    else:
+        hours = time_minutes / 60
+        return f"{hours:.1f} hours"
+
+def estimate_storage(scale):
+    '''
+    Estimate storage requirements based on scale
+    Peak storage: one strip of chunks (256 pixels high × width × 64 chunks × 3 bytes)
+    Empirical formula from testing: peak ≈ 0.075 × scale GB
+    '''
+    peak_gb = 0.075 * scale
+    
+    # Final DeepZoom storage (compressed PNGs)
+    # Power law formula fitted from empirical data
+    final_mb = 9.58017 * (scale ** 1.69713)
+    
+    if peak_gb < 1:
+        peak_str = f"{peak_gb * 1024:.0f} MB"
+    else:
+        peak_str = f"{peak_gb:.1f} GB"
+    
+    if final_mb < 1024:
+        final_str = f"{final_mb:.0f} MB"
+    else:
+        final_str = f"{final_mb / 1024:.1f} GB"
+    
+    return peak_str, final_str
+
 while True:
     try:
         im_scale_input = input("Enter image scale factor (default 4): ").strip()
@@ -48,9 +88,31 @@ while True:
             if im_scale <= 0:
                 print("Scale factor must be positive")
                 continue
-        break
+        
+        # Calculate and display estimates
+        ny_calc = im_scale * 7680
+        nx_calc = im_scale * 10240
+        estimated_time = estimate_time(im_scale)
+        peak_storage, final_storage = estimate_storage(im_scale)
+        
+        print(f"\nScale {im_scale}x:")
+        print(f"  Resolution: {ny_calc:,} × {nx_calc:,} pixels")
+        print(f"  Estimated time: {estimated_time}")
+        print(f"  Peak temp storage: {peak_storage}")
+        print(f"  Final DeepZoom size: {final_storage}")
+        
+        # Confirm with user
+        confirm = input("Continue with this scale? (y/n): ").strip().lower()
+        if confirm in ['y', 'yes']:
+            break
+        else:
+            print("Let's try a different scale.\n")
+            continue
+            
     except ValueError:
         print("Please enter a valid integer")
+
+print(f"\nStarting generation at {im_scale}x scale...")
 
 # Define calculation domain and resolution
 xmin, xmax = -2.5, 1.
@@ -214,7 +276,7 @@ if __name__ == '__main__':
     os.makedirs(level_dir, exist_ok=True)
     
     # Process one strip at a time
-    with tqdm(total=strips_per_height, desc="Processing strips", unit="strip") as pbar:
+    with tqdm(total=strips_per_height, desc="Processing strips", unit="strip", position=0) as strip_pbar:
         for strip_idx in range(strips_per_height):
             strip_y_start = strip_idx * TILE_SIZE
             strip_y_end = min((strip_idx + 1) * TILE_SIZE, ny)
@@ -235,20 +297,23 @@ if __name__ == '__main__':
             feedp = mp.Process(target=feeder, args=(inqueue, strip_y_start, strip_y_end))
             feedp.start()
             
-            # Collect chunks and save as temporary .npy files
+            # Collect chunks and save as temporary .npy files with nested progress bar
             chunk_files = []
-            for j in range(nc):
-                i, rgb_chunk = outqueue.get()
-                
-                # Save chunk temporarily
-                chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
-                np.save(chunk_file, rgb_chunk)
-                chunk_files.append((i, chunk_file))
-                
-                del rgb_chunk
-                
-                if (j + 1) % 10 == 0:
-                    gc.collect()
+            with tqdm(total=nc, desc=f"  Strip {strip_idx+1}/{strips_per_height} chunks", 
+                     unit="chunk", position=1, leave=False) as chunk_pbar:
+                for j in range(nc):
+                    i, rgb_chunk = outqueue.get()
+                    
+                    # Save chunk temporarily
+                    chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
+                    np.save(chunk_file, rgb_chunk)
+                    chunk_files.append((i, chunk_file))
+                    
+                    del rgb_chunk
+                    chunk_pbar.update(1)
+                    
+                    if (j + 1) % 10 == 0:
+                        gc.collect()
             
             # Clean up workers for this strip
             for i in range(n_process):
@@ -288,7 +353,7 @@ if __name__ == '__main__':
                     os.remove(chunk_file)
             
             gc.collect()
-            pbar.update(1)
+            strip_pbar.update(1)
     
     _log.info('All max-resolution tiles created')
     
@@ -433,3 +498,5 @@ if __name__ == '__main__':
         _log.warning(f'Could not start server on port {PORT}: {e}')
         _log.info(f'You can manually run: python3 -m http.server {PORT}')
         _log.info(f'Then open: http://localhost:{PORT}/mandelbrot_viewer.html')
+        
+        
