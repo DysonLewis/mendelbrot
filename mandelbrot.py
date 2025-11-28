@@ -14,6 +14,9 @@ import gc
 import math
 from PIL import Image
 from tqdm import tqdm
+import select
+import termios
+import tty
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, script_dir)
@@ -36,6 +39,68 @@ r2_max = 1 << 18
 # Colors will always match this scale regardless of max_iter
 # This only changes the color, tbh I just liked how it looks at 100
 color_reference = 100
+
+# Pause control state
+paused = mp.Value('i', 0)
+exit_confirm = mp.Value('i', 0)
+pause_lock = threading.Lock()
+input_thread = None
+old_settings = None
+
+def input_listener():
+    '''Background thread that listens for 'p' (pause) and 'e' (exit) key presses'''
+    global old_settings
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(sys.stdin.fileno())
+        while True:
+            if select.select([sys.stdin], [], [], 0.1)[0]:
+                ch = sys.stdin.read(1)
+                if ch.lower() == 'p':
+                    with pause_lock:
+                        if exit_confirm.value == 1:
+                            exit_confirm.value = 0
+                            paused.value = 0
+                            sys.stdout.write("\r\033[KExit cancelled - resuming")
+                            sys.stdout.flush()
+                        elif paused.value == 0:
+                            paused.value = 1
+                            sys.stdout.write("\r\033[KPause requested - will pause after current chunk/tile completes")
+                            sys.stdout.flush()
+                        else:
+                            paused.value = 0
+                            sys.stdout.write("\r\033[KResuming")
+                            sys.stdout.flush()
+                elif ch.lower() == 'e':
+                    if exit_confirm.value == 1:
+                        sys.stdout.write("\r\033[KForce quit confirmed - exiting immediately")
+                        sys.stdout.flush()
+                        if old_settings:
+                            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                        os._exit(0)
+                    else:
+                        exit_confirm.value = 1
+                        paused.value = 1
+                        sys.stdout.write("\r\033[KPress 'e' again to force quit, or 'p' to cancel and resume")
+                        sys.stdout.flush()
+                elif ch == '\x03':
+                    sys.stdout.write("\r\033[KCtrl+C detected - exiting")
+                    sys.stdout.flush()
+                    if old_settings:
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    os._exit(0)
+    finally:
+        if old_settings:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+def wait_if_paused():
+    '''Check if paused and wait until unpaused'''
+    if paused.value == 1 and exit_confirm.value == 0:
+        sys.stdout.write("\r\033[KPaused. Press 'p' to resume.")
+        sys.stdout.flush()
+    while paused.value == 1:
+        threading.Event().wait(0.1)
 
 # Get image scale factor from user with time estimate
 def estimate_time(scale):
@@ -89,7 +154,6 @@ while True:
                 print("Scale factor must be positive")
                 continue
         
-        # Calculate and display estimates
         ny_calc = im_scale * 7680
         nx_calc = im_scale * 10240
         estimated_time = estimate_time(im_scale)
@@ -101,7 +165,6 @@ while True:
         print(f"  Peak temp storage: {peak_storage}")
         print(f"  Final DeepZoom size: {final_storage}")
         
-        # Confirm with user
         confirm = input("Continue with this scale? (y/n): ").strip().lower()
         if confirm in ['y', 'yes']:
             break
@@ -112,7 +175,9 @@ while True:
     except ValueError:
         print("Please enter a valid integer")
 
-print(f"\nStarting generation at {im_scale}x scale...")
+print(f"\nStarting generation at {im_scale}x scale")
+print("Press 'p' at any time to pause/resume")
+print("Press 'e' twice within 3 seconds to force quit (or Ctrl+C)")
 
 # Define calculation domain and resolution
 xmin, xmax = -2.5, 1.
@@ -234,6 +299,10 @@ if __name__ == '__main__':
     logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
     logging.getLogger('PIL').setLevel(logging.WARNING)
 
+    # Start background thread to listen for 'p' key press
+    input_thread = threading.Thread(target=input_listener, daemon=True)
+    input_thread.start()
+
     _log.info(f'Generating Mandelbrot set at {ny} x {nx} resolution')
     
     # Setup colormap early so workers can use it
@@ -314,6 +383,9 @@ if __name__ == '__main__':
                     
                     if (j + 1) % 10 == 0:
                         gc.collect()
+                    
+                    # Check for pause after completing chunk
+                    wait_if_paused()
             
             # Clean up workers for this strip
             for i in range(n_process):
@@ -380,13 +452,15 @@ if __name__ == '__main__':
             for tile_col in range(tiles_wide):
                 tiles_to_process.append((level, tile_col, tile_row, tiles_dir, source_level))
         
-        # Process tiles in parallel
+        # Process tiles in parallel with pause support
         max_tile_workers = mp.cpu_count() * 2
         
         with mp.Pool(max_tile_workers) as pool:
             with tqdm(total=len(tiles_to_process), desc=f"Level {level}", unit="tile") as pbar:
                 for result in pool.imap_unordered(downsample_tile_worker, tiles_to_process):
                     pbar.update(1)
+                    # Check for pause after completing each tile
+                    wait_if_paused()
             pool.close()
             pool.join()
     
@@ -498,5 +572,8 @@ if __name__ == '__main__':
         _log.warning(f'Could not start server on port {PORT}: {e}')
         _log.info(f'You can manually run: python3 -m http.server {PORT}')
         _log.info(f'Then open: http://localhost:{PORT}/mandelbrot_viewer.html')
-        
-        
+    finally:
+        # Restore terminal settings on exit
+        if old_settings:
+            fd = sys.stdin.fileno()
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
