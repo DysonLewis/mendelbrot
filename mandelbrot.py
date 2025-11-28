@@ -19,12 +19,13 @@ sys.path.insert(0, script_dir)
 
 try:
     import mandelbrot
+    import image_processor
 except ImportError:
-    print("Error: mandelbrot module not found")
-    print("Please run 'make' to compile the C++ extension first")
+    print("Error: mandelbrot or image_processor module not found")
+    print("Please run 'make' to compile the C++ extensions")
     sys.exit(1)
 
-_log = logging.getLogger('hw8')
+_log = logging.getLogger('mandelbrot')
 
 # Mandelbrot calculation parameters
 max_iter = 300
@@ -35,8 +36,10 @@ r2_max = 1 << 16
 # This only changes the color, tbh I just liked how it looks at 100
 color_reference = 100
 
+# Image scale factor
+im_scale = 1
+
 # Define calculation domain and resolution
-im_scale = 2
 xmin, xmax = -2.5, 1.
 ymin, ymax = -1., 1.
 ny, nx = im_scale*7680, im_scale*10240
@@ -117,33 +120,31 @@ def process_strip_worker(args):
     '''Worker function to process one strip and save tiles'''
     strip_idx, strip_y_start, strip_y_end, strip_height, nx, bx, ex, nc, tiles_dir, max_level, strips_per_height = args
     
+    # Build strip by loading only needed portions from chunks
     strip_buffer = np.zeros((strip_height, nx, 3), dtype=np.uint8)
     
     for i in range(nc):
         chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
-        chunk_data = np.load(chunk_file)
-        strip_buffer[:, bx[i]:ex[i], :] = chunk_data[strip_y_start:strip_y_end, :, :]
-        del chunk_data
+        # Memory-map the chunk file to avoid loading entire chunk
+        chunk_mmap = np.load(chunk_file, mmap_mode='r')
+        # Copy only the needed strip portion
+        strip_buffer[:, bx[i]:ex[i], :] = chunk_mmap[strip_y_start:strip_y_end, :, :]
+        del chunk_mmap
     
-    tiles_per_width = int(math.ceil(nx / TILE_SIZE))
+    # Flip vertically using C++ extension
+    strip_buffer = image_processor.flip_vertical(strip_buffer)
     
-    for tile_x_idx in range(tiles_per_width):
-        tile_x_start = tile_x_idx * TILE_SIZE
-        tile_x_end = min((tile_x_idx + 1) * TILE_SIZE, nx)
-        
-        tile_data = strip_buffer[:, tile_x_start:tile_x_end, :]
-        
-        if tile_data.shape[0] < TILE_SIZE or tile_data.shape[1] < TILE_SIZE:
-            padded = np.zeros((TILE_SIZE, TILE_SIZE, 3), dtype=np.uint8)
-            padded[:tile_data.shape[0], :tile_data.shape[1], :] = tile_data
-            tile_data = padded
-        
-        tile_data = np.flipud(tile_data)
-        tile_row = strips_per_height - 1 - strip_idx
-        
+    # Split into tiles using C++ extension
+    tiles = image_processor.split_into_tiles(strip_buffer, TILE_SIZE)
+    del strip_buffer
+    
+    # Save tiles
+    tiles_per_width = len(tiles)
+    tile_row = strips_per_height - 1 - strip_idx
+    
+    for tile_x_idx, tile_data in enumerate(tiles):
         save_tile(tile_data, max_level, tile_x_idx, tile_row, tiles_dir)
     
-    del strip_buffer
     return strip_idx
 
 
@@ -154,7 +155,9 @@ def downsample_tile_worker(args):
     source_tile_col = tile_col * 2
     source_tile_row = tile_row * 2
     
-    source_tiles = []
+    # Load up to 4 source tiles and combine into 512x512 image
+    combined = np.zeros((TILE_SIZE * 2, TILE_SIZE * 2, 3), dtype=np.uint8)
+    
     for dy in range(2):
         for dx in range(2):
             src_col = source_tile_col + dx
@@ -164,26 +167,19 @@ def downsample_tile_worker(args):
             
             if os.path.exists(source_tile_path):
                 img = Image.open(source_tile_path)
-                source_tiles.append((dx, dy, np.array(img)))
-            else:
-                source_tiles.append((dx, dy, None))
+                tile_array = np.array(img)
+                
+                y_start = dy * TILE_SIZE
+                x_start = dx * TILE_SIZE
+                combined[y_start:y_start + tile_array.shape[0], 
+                        x_start:x_start + tile_array.shape[1], :] = tile_array
     
-    combined = np.zeros((TILE_SIZE * 2, TILE_SIZE * 2, 3), dtype=np.uint8)
+    # Downsample using C++ Lanczos implementation
+    downsampled = image_processor.downsample_tile(combined)
+    del combined
     
-    for dx, dy, tile_data in source_tiles:
-        if tile_data is not None:
-            y_start = dy * TILE_SIZE
-            x_start = dx * TILE_SIZE
-            combined[y_start:y_start + tile_data.shape[0], 
-                    x_start:x_start + tile_data.shape[1], :] = tile_data
+    save_tile(downsampled, level, tile_col, tile_row, tiles_dir)
     
-    combined_img = Image.fromarray(combined, mode='RGB')
-    downsampled = combined_img.resize((TILE_SIZE, TILE_SIZE), Image.Resampling.LANCZOS)
-    
-    tile_data = np.array(downsampled)
-    save_tile(tile_data, level, tile_col, tile_row, tiles_dir)
-    
-    del source_tiles, combined, combined_img, downsampled
     return (level, tile_col, tile_row)
 
 
@@ -259,7 +255,7 @@ if __name__ == '__main__':
         
         del rgb_chunk
         
-        if (j + 1) % 10 == 0:
+        if (j + 1) % 50 == 0:
             _log.debug(f"Progress: {j+1}/{nc} chunks computed")
             gc.collect()
     
@@ -329,12 +325,12 @@ if __name__ == '__main__':
             for tile_col in range(tiles_wide):
                 tiles_to_process.append((level, tile_col, tile_row, tiles_dir, source_level))
         
-        # Process tiles in parallel with limited workers to control memory
-        max_tile_workers = min(8, mp.cpu_count())
+        # Process tiles in parallel
+        max_tile_workers = mp.cpu_count() * 2
         
         with mp.Pool(max_tile_workers) as pool:
             for i, result in enumerate(pool.imap_unordered(downsample_tile_worker, tiles_to_process)):
-                if (i + 1) % 100 == 0:
+                if (i + 1) % 200 == 0:
                     _log.debug(f"Level {level}: processed {i + 1}/{len(tiles_to_process)} tiles")
             pool.close()
             pool.join()

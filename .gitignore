@@ -1,0 +1,5 @@
+image_processor.cpython-310-x86_64-linux-gnu.so
+mandelbrot.cpython-310-x86_64-linux-gnu.so
+mandelbrot_deepzoom.dzi
+mandelbrot_deepzoom_files/
+mandelbrot_viewer.html

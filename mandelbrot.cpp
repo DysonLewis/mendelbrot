@@ -10,7 +10,7 @@ I guess I'll keep using this though lol
 */
 
 // Mandelbrot calculation constants
-const int MAX_ITER = 750;
+const int MAX_ITER = 100;
 const double R2_MAX = 262144.0;
 const double LOG2 = std::log(2.0);
 
