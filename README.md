@@ -66,7 +66,7 @@ On a typical multi-core system*:
 
 Time scales with pixel count and number of CPU cores available.
 
-*very rough esstimates
+*very rough estimates
 ## Requirements
 
 ### Python Packages
